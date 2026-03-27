@@ -1,14 +1,15 @@
 import ml_collections
+import torch
 
 
 def get_default_configs():
   config = ml_collections.ConfigDict()
   # training
   config.training = training = ml_collections.ConfigDict()
-  config.training.batch_size = 50
-  training.n_iters = 3400001
+  config.training.batch_size = 64
+  training.n_iters = 2500001
   training.snapshot_freq = 50000
-  training.log_freq = 100
+  training.log_freq = 50
   training.eval_freq = 100
   ## store additional checkpoints for preemption in cloud computing environments
   training.snapshot_freq_for_preemption = 5000
@@ -16,10 +17,7 @@ def get_default_configs():
   training.snapshot_sampling = True
   training.likelihood_weighting = False
   training.continuous = True
-  training.n_jitted_steps = 1
   training.reduce_mean = False
-  training.smallest_time = 1e-5
-  training.score_matching_order = 1
 
   # sampling
   config.sampling = sampling = ml_collections.ConfigDict()
@@ -27,25 +25,17 @@ def get_default_configs():
   sampling.noise_removal = True
   sampling.probability_flow = False
   sampling.snr = 0.075
-  sampling.smallest_time = 1e-3
 
   # evaluation
   config.eval = evaluate = ml_collections.ConfigDict()
-  # evaluate.begin_ckpt = 126
-  # evaluate.end_ckpt = 126
-  evaluate.begin_ckpt = 52
-  evaluate.end_ckpt = 52
-  evaluate.batch_size = 100
-  evaluate.enable_sampling = False
+  evaluate.begin_ckpt = 50
+  evaluate.end_ckpt = 96
+  evaluate.batch_size = 512
+  evaluate.enable_sampling = True
   evaluate.num_samples = 50000
-  evaluate.enable_loss = False
-  evaluate.enable_bpd = True
+  evaluate.enable_loss = True
+  evaluate.enable_bpd = False
   evaluate.bpd_dataset = 'test'
-  evaluate.num_repeats = 5
-  evaluate.bound = False
-  evaluate.dsm = True
-  evaluate.dequantizer = False
-  evaluate.offset = True
 
   # data
   config.data = data = ml_collections.ConfigDict()
@@ -65,8 +55,6 @@ def get_default_configs():
   model.beta_max = 20.
   model.dropout = 0.
   model.embedding_type = 'fourier'
-  model.data_init = False
-  model.trainable_embedding = False
 
   # optimization
   config.optim = optim = ml_collections.ConfigDict()
@@ -79,5 +67,6 @@ def get_default_configs():
   optim.grad_clip = 1.
 
   config.seed = 42
+  config.device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
   return config

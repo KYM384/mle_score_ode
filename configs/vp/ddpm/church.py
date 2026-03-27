@@ -14,60 +14,48 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Training NCSNv3 on CIFAR-10 with continuous sigmas."""
+"""Config file for reproducing the results of DDPM on church_outdoor."""
 
-from configs.default_imagenet32_configs import get_default_configs
+from configs.default_lsun_configs import get_default_configs
 
 
 def get_config():
   config = get_default_configs()
+
   # training
   training = config.training
-  training.sde = 'subvpsde'
-  training.continuous = True
+  training.sde = 'vpsde'
+  training.continuous = False
   training.reduce_mean = True
-  training.n_iters = 950001
-  training.smallest_time = 1e-2
 
   # sampling
   sampling = config.sampling
-  sampling.method = 'ode'
-  sampling.smallest_time = 1e-2
-
-  # eval
-  evaluate = config.eval
-  evaluate.begin_ckpt = 19
-  evaluate.end_ckpt = 19
-  evaluate.ckpt_id = 19
+  sampling.method = 'pc'
+  sampling.predictor = 'ancestral_sampling'
+  sampling.corrector = 'none'
 
   # data
   data = config.data
+  data.category = 'church_outdoor'
   data.centered = True
 
   # model
   model = config.model
-  model.name = 'ncsnpp'
+  model.name = 'ddpm'
   model.scale_by_sigma = False
+  model.num_scales = 1000
   model.ema_rate = 0.9999
   model.normalization = 'GroupNorm'
   model.nonlinearity = 'swish'
   model.nf = 128
-  model.ch_mult = (1, 2, 2, 2)
-  model.num_res_blocks = 8
+  model.ch_mult = (1, 1, 2, 2, 4, 4)
+  model.num_res_blocks = 2
   model.attn_resolutions = (16,)
   model.resamp_with_conv = True
   model.conditional = True
-  model.fir = False
-  model.fir_kernel = [1, 3, 3, 1]
-  model.skip_rescale = True
-  model.resblock_type = 'biggan'
-  model.progressive = 'none'
-  model.progressive_input = 'none'
-  model.progressive_combine = 'sum'
-  model.attention_type = 'ddpm'
-  model.init_scale = 0.
-  model.embedding_type = 'positional'
-  model.fourier_scale = 16
-  model.conv_size = 3
+
+  # optim
+  optim = config.optim
+  optim.lr = 2e-5
 
   return config

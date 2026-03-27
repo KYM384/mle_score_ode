@@ -1,4 +1,5 @@
 import ml_collections
+import torch
 
 
 def get_default_configs():
@@ -6,12 +7,12 @@ def get_default_configs():
   # training
   config.training = training = ml_collections.ConfigDict()
   # First and second order score
-  # config.training.batch_size = 128
+  config.training.batch_size = 128
 
   # Third score
-  config.training.batch_size = 48
+  # config.training.batch_size = 48
 
-  training.n_iters = 1400001
+  training.n_iters = 1300001
   training.snapshot_freq = 50000
   training.log_freq = 100
   training.eval_freq = 100
@@ -24,7 +25,6 @@ def get_default_configs():
   training.continuous = True
   training.n_jitted_steps = 1
   training.reduce_mean = False
-  training.smallest_time = 1e-5
   training.score_matching_order = 1
 
   # sampling
@@ -60,7 +60,7 @@ def get_default_configs():
 
   # data
   config.data = data = ml_collections.ConfigDict()
-  data.dataset = 'ImageNet'
+  data.dataset = 'ImageNet32'
   data.image_size = 32
   data.random_flip = False
   data.centered = False
@@ -90,5 +90,6 @@ def get_default_configs():
   optim.grad_clip = 1.
 
   config.seed = 42
+  config.device = torch.device('cuda:0') if torch.cuda.is_available() else torch.device('cpu')
 
   return config

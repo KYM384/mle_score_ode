@@ -26,18 +26,13 @@ def get_config():
   training.sde = 'vpsde'
   training.continuous = True
   training.reduce_mean = True
-  training.n_iters = 2050001
+  training.n_iters = 950001
 
   # sampling
   sampling = config.sampling
-  sampling.method = 'ode'
-  sampling.smallest_time = 1e-3
-
-  # eval
-  evaluate = config.eval
-  evaluate.begin_ckpt = 19
-  evaluate.end_ckpt = 19
-  evaluate.ckpt_id = 19
+  sampling.method = 'pc'
+  sampling.predictor = 'euler_maruyama'
+  sampling.corrector = 'none'
 
   # data
   data = config.data

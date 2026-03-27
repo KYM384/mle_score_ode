@@ -29,8 +29,9 @@ def get_config():
 
   # sampling
   sampling = config.sampling
-  sampling.method = 'ode'
-  sampling.smallest_time = 1e-3
+  sampling.method = 'pc'
+  sampling.predictor = 'euler_maruyama'
+  sampling.corrector = 'none'
 
   # data
   data = config.data

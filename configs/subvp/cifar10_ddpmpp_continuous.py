@@ -26,12 +26,12 @@ def get_config():
   training.sde = 'subvpsde'
   training.continuous = True
   training.reduce_mean = True
-  training.smallest_time = 1e-2
 
   # sampling
   sampling = config.sampling
-  sampling.method = 'ode'
-  sampling.smallest_time = 1e-2
+  sampling.method = 'pc'
+  sampling.predictor = 'euler_maruyama'
+  sampling.corrector = 'none'
 
   # data
   data = config.data

@@ -14,31 +14,23 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Training NCSNv3 on CIFAR-10 with continuous sigmas."""
-
-from configs.default_imagenet32_configs import get_default_configs
+"""Training NCSN++ on CIFAR-10 with sub-VP SDE."""
+from configs.default_cifar10_configs import get_default_configs
 
 
 def get_config():
   config = get_default_configs()
   # training
   training = config.training
-  training.sde = 'vpsde'
+  training.sde = 'subvpsde'
   training.continuous = True
   training.reduce_mean = True
-  training.n_iters = 950001
-  training.smallest_time = 5e-5 if training.likelihood_weighting and training.importance_weighting else 1e-5
 
   # sampling
   sampling = config.sampling
-  sampling.method = 'ode'
-  sampling.smallest_time = 1e-3
-
-  # eval
-  evaluate = config.eval
-  evaluate.begin_ckpt = 19
-  evaluate.end_ckpt = 19
-  evaluate.ckpt_id = 19
+  sampling.method = 'pc'
+  sampling.predictor = 'euler_maruyama'
+  sampling.corrector = 'none'
 
   # data
   data = config.data
@@ -53,20 +45,20 @@ def get_config():
   model.nonlinearity = 'swish'
   model.nf = 128
   model.ch_mult = (1, 2, 2, 2)
-  model.num_res_blocks = 8
+  model.num_res_blocks = 4
   model.attn_resolutions = (16,)
   model.resamp_with_conv = True
   model.conditional = True
-  model.fir = False
+  model.fir = True
   model.fir_kernel = [1, 3, 3, 1]
   model.skip_rescale = True
   model.resblock_type = 'biggan'
   model.progressive = 'none'
-  model.progressive_input = 'none'
+  model.progressive_input = 'residual'
   model.progressive_combine = 'sum'
   model.attention_type = 'ddpm'
-  model.init_scale = 0.
   model.embedding_type = 'positional'
+  model.init_scale = 0.
   model.fourier_scale = 16
   model.conv_size = 3
 

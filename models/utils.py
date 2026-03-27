@@ -15,42 +15,10 @@
 
 """All functions and modules related to model definition.
 """
-from typing import Any
 
-import flax
-import functools
-import jax.numpy as jnp
-
-import datasets
+import torch
 import sde_lib
-import jax
 import numpy as np
-from flax.training import checkpoints
-from utils import batch_mul
-
-
-# The dataclass that stores all training states
-@flax.struct.dataclass
-class State:
-  step: int
-  optimizer: flax.optim.Optimizer
-  lr: float
-  model_state: Any
-  ema_rate: float
-  params_ema: Any
-  rng: Any
-
-
-@flax.struct.dataclass
-class DeqState:
-  step: int
-  optimizer: flax.optim.Optimizer
-  lr: float
-  ema_rate: float
-  params_ema: Any
-  ema_train_bpd: float
-  ema_eval_bpd: float
-  rng: Any
 
 
 _MODELS = {}
@@ -86,15 +54,9 @@ def get_sigmas(config):
   Returns:
     sigmas: a jax numpy arrary of noise levels
   """
+  sigmas = np.exp(
+    np.linspace(np.log(config.model.sigma_max), np.log(config.model.sigma_min), config.model.num_scales))
 
-  if config.training.sde.lower() == 'linearvesde':
-    sigmas = jnp.sqrt(jnp.linspace(config.model.sigma_max ** 2, config.model.sigma_min ** 2,
-                                   config.model.num_scales))
-  else:
-    sigmas = jnp.exp(
-      jnp.linspace(
-        jnp.log(config.model.sigma_max), jnp.log(config.model.sigma_min),
-        config.model.num_scales))
   return sigmas
 
 
@@ -123,169 +85,92 @@ def get_ddpm_params(config):
   }
 
 
-def init_model(rng, config, data=None, label=None):
-  """ Initialize a `flax.linen.Module` model. """
+def create_model(config):
+  """Create the score model."""
   model_name = config.model.name
-  model_def = functools.partial(get_model(model_name), config=config)
-  input_shape = (config.training.batch_size // jax.local_device_count(),
-                 config.data.image_size, config.data.image_size, config.data.num_channels)
-  label_shape = input_shape[:1]
-  if data is None:
-    init_input = jnp.zeros(input_shape)
-  else:
-    init_input = data
-  if label is None:
-    init_label = jnp.zeros(label_shape, dtype=jnp.int32)
-  else:
-    init_label = label
-  params_rng, dropout_rng = jax.random.split(rng)
-  model = model_def()
-  variables = model.init({'params': params_rng, 'dropout': dropout_rng}, init_input, init_label)
-  # Variables is a `flax.FrozenDict`. It is immutable and respects functional programming
-  init_model_state, initial_params = variables.pop('params')
-  return model, init_model_state, initial_params
+  score_model = get_model(model_name)(config)
+  score_model = score_model.to(config.device)
+  score_model = torch.nn.DataParallel(score_model)
+  return score_model
 
 
-def data_dependent_init_of_dequantizer(rng, config, init_data):
-  if config.data.dataset == 'ImageNet':
-    if config.data.image_size == 32:
-      from .flowpp import dequantization_imagenet32
-      model = dequantization_imagenet32.Dequantization()
-    elif config.data.image_size == 64:
-      from .flowpp import dequantization_imagenet64
-      model = dequantization_imagenet64.Dequantization()
-  elif config.data.dataset == 'CIFAR10':
-    from .flowpp import dequantization_cifar10
-    model = dequantization_cifar10.Dequantization()
-
-  rng, step_rng = jax.random.split(rng)
-  u = jax.random.normal(step_rng, init_data.shape)
-
-  @functools.partial(jax.pmap, axis_name='batch')
-  def init_func(params_rng, dropout_rng, eps, data):
-    return model.init({'params': params_rng, 'dropout': dropout_rng}, eps, data, inverse=False, train=False)
-
-  rng, *params_rng = jax.random.split(rng, jax.local_device_count() + 1)
-  params_rng = jnp.asarray(params_rng)
-  rng, *dropout_rng = jax.random.split(rng, jax.local_device_count() + 1)
-  dropout_rng = jnp.asarray(dropout_rng)
-  variables = flax.jax_utils.unreplicate(init_func(params_rng, dropout_rng, u, init_data))
-  return model, variables
-
-
-def get_dequantizer(model, variables, train=False):
-  def dequantizer(u, x, rng=None):
-    if not train:
-      u_deq, sldj = model.apply(variables, u, x, train=train, inverse=False)
-    else:
-      u_deq, sldj = model.apply(variables, u, x, train=train, inverse=False, rngs={'dropout': rng})
-
-    return u_deq, sldj
-
-  return dequantizer
-
-
-def get_model_fn(model, params, states, train=False):
+def get_model_fn(model, train=False):
   """Create a function to give the output of the score-based model.
 
   Args:
-    model: A `flax.linen.Module` object the represent the architecture of score-based model.
-    params: A dictionary that contains all trainable parameters.
-    states: A dictionary that contains all mutable states.
+    model: The score model.
     train: `True` for training and `False` for evaluation.
 
   Returns:
     A model function.
   """
 
-  def model_fn(x, labels, rng=None):
+  def model_fn(x, labels):
     """Compute the output of the score-based model.
 
     Args:
       x: A mini-batch of input data.
       labels: A mini-batch of conditioning variables for time steps. Should be interpreted differently
         for different models.
-      rng: If present, it is the random state for dropout
 
     Returns:
       A tuple of (model output, new mutable states)
     """
-    variables = {'params': params, **states}
     if not train:
-      return model.apply(variables, x, labels, train=False, mutable=False), states
+      model.eval()
+      return model(x, labels)
     else:
-      rngs = {'dropout': rng}
-      return model.apply(variables, x, labels, train=True, mutable=list(states.keys()), rngs=rngs)
-      # if states:
-      #   return outputs
-      # else:
-      #   return outputs, states
+      model.train()
+      return model(x, labels)
 
   return model_fn
 
 
-def get_score_fn(sde, model, params, states, train=False, continuous=False, return_state=False):
+def get_score_fn(sde, model, train=False, continuous=False):
   """Wraps `score_fn` so that the model output corresponds to a real time-dependent score function.
 
   Args:
     sde: An `sde_lib.SDE` object that represents the forward SDE.
-    model: A `flax.linen.Module` object that represents the architecture of the score-based model.
-    params: A dictionary that contains all trainable parameters.
-    states: A dictionary that contains all other mutable parameters.
+    model: A score model.
     train: `True` for training and `False` for evaluation.
     continuous: If `True`, the score-based model is expected to directly take continuous time steps.
-    return_state: If `True`, return the new mutable states alongside the model output.
 
   Returns:
     A score function.
   """
-  model_fn = get_model_fn(model, params, states, train=train)
+  model_fn = get_model_fn(model, train=train)
 
   if isinstance(sde, sde_lib.VPSDE) or isinstance(sde, sde_lib.subVPSDE):
-    def score_fn(x, t, rng=None):
+    def score_fn(x, t):
       # Scale neural network output by standard deviation and flip sign
       if continuous or isinstance(sde, sde_lib.subVPSDE):
         # For VP-trained models, t=0 corresponds to the lowest noise level
         # The maximum value of time embedding is assumed to 999 for
         # continuously-trained models.
         labels = t * 999
-        model, state = model_fn(x, labels, rng)
-        std = sde.marginal_prob(jnp.zeros_like(x), t)[1]
+        score = model_fn(x, labels)
+        std = sde.marginal_prob(torch.zeros_like(x), t)[1]
       else:
         # For VP-trained models, t=0 corresponds to the lowest noise level
         labels = t * (sde.N - 1)
-        model, state = model_fn(x, labels, rng)
-        std = sde.sqrt_1m_alphas_cumprod[labels.astype(jnp.int32)]
+        score = model_fn(x, labels)
+        std = sde.sqrt_1m_alphas_cumprod.to(labels.device)[labels.long()]
 
-      score = batch_mul(-model, 1. / std)
-      if return_state:
-        return score, state
-      else:
-        return score
+      score = -score / std[:, None, None, None]
+      return score
 
   elif isinstance(sde, sde_lib.VESDE):
-    def score_fn(x, t, rng=None):
-      if sde.linear is False:
-        if continuous:
-          labels = sde.marginal_prob(jnp.zeros_like(x), t)[1]
-        else:
-          # For VE-trained models, t=0 corresponds to the highest noise level
-          labels = sde.T - t
-          labels *= sde.N - 1
-          labels = jnp.round(labels).astype(jnp.int32)
-
-        score, state = model_fn(x, labels, rng)
+    def score_fn(x, t):
+      if continuous:
+        labels = sde.marginal_prob(torch.zeros_like(x), t)[1]
       else:
-        assert continuous
-        labels = t * 999
-        model, state = model_fn(x, labels, rng)
-        std = sde.marginal_prob(jnp.zeros_like(x), t)[1]
-        score = batch_mul(-model, 1. / std)
+        # For VE-trained models, t=0 corresponds to the highest noise level
+        labels = sde.T - t
+        labels *= sde.N - 1
+        labels = torch.round(labels).long()
 
-      if return_state:
-        return score, state
-      else:
-        return score
+      score = model_fn(x, labels)
+      return score
 
   else:
     raise NotImplementedError(f"SDE class {sde.__class__.__name__} not yet supported.")
@@ -294,10 +179,10 @@ def get_score_fn(sde, model, params, states, train=False, continuous=False, retu
 
 
 def to_flattened_numpy(x):
-  """Flatten a JAX array `x` and convert it to numpy."""
-  return np.asarray(x.reshape((-1,)), dtype=np.float64)
+  """Flatten a torch tensor `x` and convert it to numpy."""
+  return x.detach().cpu().numpy().reshape((-1,))
 
 
 def from_flattened_numpy(x, shape):
-  """Form a JAX array with the given `shape` from a flattened numpy array `x`."""
-  return jnp.asarray(x, dtype=jnp.float32).reshape(shape)
+  """Form a torch tensor with the given `shape` from a flattened numpy array `x`."""
+  return torch.from_numpy(x.reshape(shape))

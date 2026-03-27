@@ -28,11 +28,13 @@ def get_config():
     training.reduce_mean = True
     training.likelihood_weighting = False
     training.importance_weighting = False
+    training.n_iters = 950001
 
     # sampling
     sampling = config.sampling
-    sampling.method = "ode"
-    sampling.smallest_time = 1e-5
+    sampling.method = "pc"
+    sampling.predictor = "reverse_diffusion"
+    sampling.corrector = "langevin"
 
     # data
     data = config.data

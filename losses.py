@@ -16,23 +16,18 @@
 """All functions related to loss computation and optimization.
 """
 
-import flax
-import jax
-import jax.numpy as jnp
-import jax.random as random
+import torch
+import torch.optim as optim
+import numpy as np
 from models import utils as mutils
 from sde_lib import VESDE, VPSDE
-from utils import batch_mul, get_div_fn, get_value_div_fn
-import functools
-import numpy as np
-from bound_likelihood import get_likelihood_offset_fn
 
 
-def get_optimizer(config, beta2=0.999):
+def get_optimizer(config, params):
   """Returns a flax optimizer object based on `config`."""
   if config.optim.optimizer == 'Adam':
-    optimizer = flax.optim.Adam(beta1=config.optim.beta1, beta2=beta2, eps=config.optim.eps,
-                                weight_decay=config.optim.weight_decay)
+    optimizer = optim.Adam(params, lr=config.optim.lr, betas=(config.optim.beta1, 0.999), eps=config.optim.eps,
+                           weight_decay=config.optim.weight_decay)
   else:
     raise NotImplementedError(
       f'Optimizer {config.optim.optimizer} not supported yet!')
@@ -40,248 +35,200 @@ def get_optimizer(config, beta2=0.999):
   return optimizer
 
 
-def optimization_manager(config, deq_score_joint=False):
+def optimization_manager(config):
   """Returns an optimize_fn based on `config`."""
 
-  def optimize_fn(state,
-                  grad,
+  def optimize_fn(optimizer, params, step, lr=config.optim.lr,
                   warmup=config.optim.warmup,
                   grad_clip=config.optim.grad_clip):
     """Optimizes with warmup and gradient clipping (disabled if negative)."""
-    lr = state.lr
     if warmup > 0:
-      lr = lr * jnp.minimum(state.step / warmup, 1.0)
+      for g in optimizer.param_groups:
+        g['lr'] = lr * np.minimum(step / warmup, 1.0)
     if grad_clip >= 0:
-      # Compute global gradient norm
-      grad_norm = jnp.sqrt(
-        sum([jnp.sum(jnp.square(x)) for x in jax.tree_leaves(grad)]))
-      # Clip gradient
-      clipped_grad = jax.tree_map(
-        lambda x: x * grad_clip / jnp.maximum(grad_norm, grad_clip), grad)
-    else:  # disabling gradient clipping if grad_clip < 0
-      clipped_grad = grad
-    return state.optimizer.apply_gradient(clipped_grad, learning_rate=lr)
+      torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip)
+    optimizer.step()
 
-  def optimize_deq_score_fn(state,
-                            grad,
-                            warmup=config.optim.warmup,
-                            grad_clip=config.optim.grad_clip):
-    lr = state.lr
-    if warmup > 0:
-      lr = lr * jnp.minimum(state.step / warmup, 1.0)
-    if grad_clip >= 0:
-      # Compute global gradient norm
-      grad_norm = jnp.sqrt(
-        sum([jnp.sum(jnp.square(x)) for x in jax.tree_leaves(grad)]))
-      # Clip gradient
-      clipped_grad = jax.tree_map(
-        lambda x: x * grad_clip / jnp.maximum(grad_norm, grad_clip), grad)
-    else:  # disabling gradient clipping if grad_clip < 0
-      clipped_grad = grad
-    return (state.deq_optimizer.apply_gradient(clipped_grad['deq'], learning_rate=lr),
-            state.score_optimizer.apply_gradient(clipped_grad['score'], learning_rate=lr))
-
-  if deq_score_joint:
-    return optimize_deq_score_fn
-  else:
-    return optimize_fn
+  return optimize_fn
 
 
-def get_score_t(score_fn):
-  def score_t(x, t, rng):
-    tangent = jnp.ones_like(t)
-    return jax.jvp(lambda time: score_fn(x, time, rng=rng), (t,), (tangent,))
-
-  return score_t
-
-
-def get_sde_loss_fn(sde, model, train, reduce_mean=True, continuous=True, likelihood_weighting=True,
-                    importance_weighting=True, eps=1e-5, score_matching_order=1):
+def get_sde_loss_fn(sde, train, reduce_mean=True, continuous=True, likelihood_weighting=True, eps=1e-5, loss_type="original"):
   """Create a loss function for training with arbirary SDEs.
 
   Args:
     sde: An `sde_lib.SDE` object that represents the forward SDE.
-    model: A `flax.linen.Module` object that represents the architecture of the score-based model.
     train: `True` for training loss and `False` for evaluation loss.
     reduce_mean: If `True`, average the loss across data dimensions. Otherwise sum the loss across data dimensions.
     continuous: `True` indicates that the model is defined to take continuous time steps. Otherwise it requires
       ad-hoc interpolation to take continuous time steps.
     likelihood_weighting: If `True`, weight the mixture of score matching losses
       according to https://arxiv.org/abs/2101.09258; otherwise use the weighting recommended in our paper.
-    importance_weighting: If `True`, use importance weighting to reduce the variance of likelihood weighting.
     eps: A `float` number. The smallest time step to sample from.
 
   Returns:
     A loss function.
   """
-  reduce_op = jnp.mean if reduce_mean else lambda *args, **kwargs: 0.5 * jnp.sum(*args, **kwargs)
+  reduce_op = torch.mean if reduce_mean else lambda *args, **kwargs: 0.5 * torch.sum(*args, **kwargs)
 
-  def loss_fn(rng, params, states, batch):
+  def loss_fn(model, batch):
     """Compute the loss function.
 
     Args:
-      rng: A JAX random state.
-      params: A dictionary that contains trainable parameters of the score-based model.
-      states: A dictionary that contains mutable states of the score-based model.
+      model: A score model.
       batch: A mini-batch of training data.
 
     Returns:
       loss: A scalar that represents the average loss value across the mini-batch.
-      new_model_state: A dictionary that contains the mutated states of the score-based model.
     """
+    score_fn = mutils.get_score_fn(sde, model, train=train, continuous=continuous)
+    t = torch.rand(batch.shape[0], device=batch.device) * (sde.T - eps) + eps
+    z = torch.randn_like(batch)
+    mean, std = sde.marginal_prob(batch, t)
+    perturbed_data = mean + std[:, None, None, None] * z
+    score = score_fn(perturbed_data, t)
 
-    score_fn = mutils.get_score_fn(sde, model, params, states, train=train, continuous=continuous, return_state=True)
-    score_fn_div = mutils.get_score_fn(sde, model, params, states, train=train, continuous=continuous, return_state=False)
-    data = batch['image']
+    if not likelihood_weighting:
+      losses = torch.square(score * std[:, None, None, None] + z)
+      losses = reduce_op(losses.reshape(losses.shape[0], -1), dim=-1)
 
-    rng, step_rng = random.split(rng)
-    if likelihood_weighting and importance_weighting:
-      t = sde.sample_importance_weighted_time_for_likelihood(step_rng, (data.shape[0],), eps=eps)
-    else:
-      t = random.uniform(step_rng, (data.shape[0],), minval=eps, maxval=sde.T)
+      if loss_type == "new":
+        with torch.no_grad():
+            batch_size = batch.shape[0] // 2
+            dim = perturbed_data.shape[1] * perturbed_data.shape[2] * perturbed_data.shape[3]
+            xt = perturbed_data[:batch_size].view(batch_size, -1)  # (batch_size, -1)
+            x0 = batch[:batch_size].view(xt.shape[0], -1)  # (batch_size, -1)
+            alpha_t = torch.ones(batch_size, 1, device=batch.device)  # (batch_size, 1)
+            sigma_t = std[:batch_size, None]  # (batch_size, 1)
 
-    rng, step_rng = random.split(rng)
-    z = random.normal(step_rng, data.shape)
-    mean, std = sde.marginal_prob(data, t)
-    perturbed_data = mean + batch_mul(std, z)
-    rng, step_rng = random.split(rng)
+            weight = -0.5 * (xt.unsqueeze(1) - alpha_t.unsqueeze(1)*x0.unsqueeze(0)).pow(2).sum(-1,True) / sigma_t.unsqueeze(1)**2
+            weight_normalized = torch.softmax(weight, 1)  # (batch_size, batch_size, 1)
 
-    def inner_prod(x, y):
-      x = x.reshape((x.shape[0], -1))
-      y = y.reshape((y.shape[0], -1))
-      return jnp.sum(x * y, axis=-1, keepdims=True)
+            score_cond = - (xt.unsqueeze(1) - alpha_t.unsqueeze(1)*x0.unsqueeze(0)) / sigma_t.unsqueeze(1)**2  # (batch_size, batch_size, 2)
+            score_gt = (weight_normalized * score_cond).sum(1)  # (batch_size, 2)
 
-    if score_matching_order == 1:
-      rng, step_rng = random.split(rng)
-      score, new_model_state = score_fn(perturbed_data, t, rng=step_rng)
-      losses_2 = jnp.zeros((perturbed_data.shape[0],))
-      losses_3 = jnp.zeros_like(losses_2)
-    elif score_matching_order == 2:
-      v = random.randint(step_rng, data.shape, minval=0, maxval=2).astype(jnp.float32) * 2 - 1
-      rng, step_rng = random.split(rng)
+            score_score_gt = (weight_normalized * score_cond.pow(2).sum(-1,True)).sum(1)  # (batch_size, 1)
 
-      def score_jvp_fn(x, t, eps, step_rng, score_fn):
-          fn = lambda inputs: score_fn(inputs, t, rng=step_rng)
-          score, score_vjp = jax.jvp(fn, (x,), (eps,))
-          return score_vjp, score
+            x0_2 = batch[batch_size:-1].view(batch_size-1, -1)  # (batch_size, -1)
+            x0_2 = torch.cat([x0.unsqueeze(1), x0_2.unsqueeze(0).repeat(batch_size,1,1)], 1)  # (batch_size, batch_size, 2)
 
-      dim = int(np.prod(data.shape[1:]))
-      new_model_state = states
-      score_vjp, score = score_jvp_fn(perturbed_data, t, v, step_rng, score_fn_div)
-      score_fixed = jax.lax.stop_gradient(score)
-      std_2 = jnp.square(std).reshape((data.shape[0], 1))
-      std = std.reshape((data.shape[0], 1))
-      v_2 = inner_prod(v, v)
+            weight = -0.5 * (xt.unsqueeze(1) - alpha_t.unsqueeze(1)*x0_2).pow(2).sum(-1,True) / sigma_t.unsqueeze(1)**2
+            weight_normalized = torch.softmax(weight, 1)  # (batch_size, batch_size, 1)
+            score_cond = - (xt.unsqueeze(1) - alpha_t.unsqueeze(1)*x0_2) / sigma_t.unsqueeze(1)**2  # (batch_size, batch_size, 2)
+            score_gt_2 = (weight_normalized * score_cond).sum(1)  # (batch_size, 2)
 
-      cond_score = (z.reshape((data.shape[0], dim)) + score_fixed.reshape((data.shape[0], dim)) * std).reshape((data.shape[0], dim))
-      cond_score_v_prod_norm_square = jnp.square(inner_prod(cond_score, v))
-      # Frobenius:
-      losses_2_frob = (
-          (score_vjp.reshape((data.shape[0], dim)) * std_2)
-          + v.reshape((data.shape[0], dim))
-          - (inner_prod(cond_score, v)) * cond_score
-      )
-      losses_2_frob = jnp.square(losses_2_frob) / float(dim)
-      losses_2_frob = reduce_op(losses_2_frob.reshape((losses_2_frob.shape[0], -1)), axis=-1)
+            cov_trace = score_score_gt - (score_gt*score_gt_2).sum(-1,True)  # (batch_size, 1)
+            hessian_trace = - torch.ones_like(cov_trace)  # (batch_size, 1)
+            score_gt_jvp_trace = hessian_trace + cov_trace * sigma_t**2 / dim
 
-      # Trace:
-      score_div = inner_prod(score_vjp, v)
-      losses_2 = score_div * std_2 + v_2 - cond_score_v_prod_norm_square
-      assert reduce_mean
-      losses_2 = losses_2 / float(dim)
-      losses_2 = jnp.square(losses_2)
-      losses_2 = reduce_op(losses_2.reshape((losses_2.shape[0], -1)), axis=-1)
+        # v = torch.sign(torch.randn_like(perturbed_data[:batch_size]))
+        # h = 0.01
+        # score_jvp = (score_fn(perturbed_data[:batch_size] + h * v, t[:batch_size]) - score[:batch_size].detach()) / h
+        # score_jvp_trace = (score_jvp * v).sum((1,2,3))[:, None]
+        perturbed_data.requires_grad = True
+        score = score_fn(perturbed_data, t)
+        v = torch.sign(torch.randn_like(score))
+        score_vjp = torch.autograd.grad(
+          outputs=score, inputs=perturbed_data, grad_outputs=v, 
+          create_graph=True,
+        )[0]
+        dim = perturbed_data.shape[1] * perturbed_data.shape[2] * perturbed_data.shape[3]
+        score_jvp_trace = (score_vjp * v).sum((1,2,3))[:batch_size, None]
 
-      losses_2 = losses_2 + losses_2_frob
-
-      losses_3 = jnp.zeros_like(losses_2)
-    elif score_matching_order == 3:
-      v = random.randint(step_rng, data.shape, minval=0, maxval=2).astype(jnp.float32) * 2 - 1
-      rng, step_rng = random.split(rng)
-
-      def grad_div_fn(x, t, eps, step_rng, score_fn):
-          def score_jvp_fn(data):
-              fn = lambda inputs: score_fn(inputs, t, rng=step_rng)
-              score, score_jvp = jax.jvp(fn, (data,), (eps,))
-              return jnp.sum(eps * score_jvp), (score_jvp, score)
-
-          grad_div, (score_jvp, score) = jax.grad(score_jvp_fn, has_aux=True)(x)
-          return grad_div, score_jvp, score
-
-      dim = int(np.prod(data.shape[1:]))
-      new_model_state = states
-      score_grad_div, score_jvp, score = grad_div_fn(perturbed_data, t, v, step_rng, score_fn_div)
-      score_fixed = jax.lax.stop_gradient(score)
-      std_2 = jnp.square(std).reshape((data.shape[0], 1))
-      std = std.reshape((data.shape[0], 1))
-      v_2 = inner_prod(v, v)
-
-      cond_score = (z.reshape((data.shape[0], dim)) + score_fixed.reshape((data.shape[0], dim)) * std).reshape((data.shape[0], dim))
-      cond_score_v_prod_norm_square = jnp.square(inner_prod(cond_score, v))
-      # Frobenius:
-      losses_2_frob = (
-          (score_jvp.reshape((data.shape[0], dim)) * std_2)
-          + v.reshape((data.shape[0], dim))
-          - (inner_prod(cond_score, v)) * cond_score
-      )
-      losses_2_frob = jnp.square(losses_2_frob) / float(dim)
-      losses_2_frob = reduce_op(losses_2_frob.reshape((losses_2_frob.shape[0], -1)), axis=-1)
-
-      # Trace:
-      score_div = inner_prod(score_jvp, v)
-      losses_2 = score_div * std_2 + v_2 - cond_score_v_prod_norm_square
-      assert reduce_mean
-      losses_2 = losses_2 / float(dim)
-      losses_2 = jnp.square(losses_2)
-      losses_2 = reduce_op(losses_2.reshape((losses_2.shape[0], -1)), axis=-1)
-
-      losses_2 = losses_2 + losses_2_frob
-
-      score_div = jax.lax.stop_gradient(score_div)
-      score_jvp = jax.lax.stop_gradient(score_jvp)
-      losses_3 = (
-          std_2 * std * score_grad_div.reshape((data.shape[0], dim))
-          + cond_score_v_prod_norm_square * cond_score
-          - (std_2 * score_div + v_2) * cond_score
-          - 2 * inner_prod(v, cond_score) * (std_2 * score_jvp.reshape((data.shape[0], dim)) + v.reshape((data.shape[0], dim)))
-      )
-      losses_3 = losses_3 / float(dim)
-      losses_3 = jnp.square(losses_3)
-      losses_3 = reduce_op(losses_3.reshape((losses_3.shape[0], dim)), axis=-1)
-
-    else:
-      assert ValueError("Unsupported loss type {}".format(loss_type))
-
-    if likelihood_weighting:
-      if importance_weighting:
-        losses = jnp.square(batch_mul(score, std) + z)
-        losses = reduce_op(losses.reshape((losses.shape[0], -1)), axis=-1)
+        losses2 = torch.square(score_jvp_trace * sigma_t**2 / dim - score_gt_jvp_trace)
+        losses2 = 0.5 * reduce_op(losses2, dim=-1)
       else:
-        g2 = sde.sde(jnp.zeros_like(data), t)[1] ** 2
-        losses = jnp.square(score + batch_mul(z, 1. / std))
-        losses = reduce_op(losses.reshape((losses.shape[0], -1)), axis=-1) * g2
+        perturbed_data.requires_grad = True
+        score = score_fn(perturbed_data, t)
+
+        v = torch.sign(torch.randn_like(score))
+        score_vjp = torch.autograd.grad(
+          outputs=score, inputs=perturbed_data, grad_outputs=v, 
+          create_graph=True,
+        )[0]
+        dim = perturbed_data.shape[1] * perturbed_data.shape[2] * perturbed_data.shape[3]
+        div_score = (score_vjp * v).sum((1,2,3))
+
+      if loss_type == "mse":
+        losses2 = losses*0
+
+      elif loss_type == "original":
+        l1 = (score * std[:,None,None,None] + z).detach()
+        losses2_frob = torch.square(
+          score_vjp * std[:,None,None,None]**2 + v - (l1 * v).sum((1,2,3),True) * l1
+        ) / dim
+        losses2_div = torch.square(
+          div_score * std**2 + dim - (l1*v).sum((1,2,3)).pow(2)
+        ) / dim**2
+        losses2_frob = reduce_op(losses2_frob.reshape(losses2_frob.shape[0], -1), dim=-1)
+        losses2_div = reduce_op(losses2_div.reshape(losses2_div.shape[0], -1), dim=-1)
+        losses2 = losses2_frob + losses2_div
+
+      elif loss_type == "proposed":
+        losses2 = 0.01 * torch.square(div_score * std**2 + dim * torch.ones_like(div_score)) / dim
 
     else:
-      losses = jnp.square(batch_mul(score, std) + z)
-      losses = reduce_op(losses.reshape((losses.shape[0], -1)), axis=-1)
+      g2 = sde.sde(torch.zeros_like(batch), t)[1] ** 2
+      losses = torch.square(score + z / std[:, None, None, None])
+      losses = reduce_op(losses.reshape(losses.shape[0], -1), dim=-1) * g2
 
-    loss1 = jnp.mean(losses)
-    loss2 = jnp.mean(losses_2)
-    loss3 = jnp.mean(losses_3)
-    loss = loss1 + loss2 + loss3
-    return loss, (new_model_state, loss1, loss2, loss3)
+    loss = torch.mean(losses), torch.mean(losses2)
+    return loss
 
   return loss_fn
 
 
-def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False,
-                importance_weighting=False, smallest_time=1e-5, score_matching_order=1):
+def get_smld_loss_fn(vesde, train, reduce_mean=False):
+  """Legacy code to reproduce previous results on SMLD(NCSN). Not recommended for new work."""
+  assert isinstance(vesde, VESDE), "SMLD training only works for VESDEs."
+
+  # Previous SMLD models assume descending sigmas
+  smld_sigma_array = torch.flip(vesde.discrete_sigmas, dims=(0,))
+  reduce_op = torch.mean if reduce_mean else lambda *args, **kwargs: 0.5 * torch.sum(*args, **kwargs)
+
+  def loss_fn(model, batch):
+    model_fn = mutils.get_model_fn(model, train=train)
+    labels = torch.randint(0, vesde.N, (batch.shape[0],), device=batch.device)
+    sigmas = smld_sigma_array.to(batch.device)[labels]
+    noise = torch.randn_like(batch) * sigmas[:, None, None, None]
+    perturbed_data = noise + batch
+    score = model_fn(perturbed_data, labels)
+    target = -noise / (sigmas ** 2)[:, None, None, None]
+    losses = torch.square(score - target)
+    losses = reduce_op(losses.reshape(losses.shape[0], -1), dim=-1) * sigmas ** 2
+    loss = torch.mean(losses)
+    return loss
+
+  return loss_fn
+
+
+def get_ddpm_loss_fn(vpsde, train, reduce_mean=True):
+  """Legacy code to reproduce previous results on DDPM. Not recommended for new work."""
+  assert isinstance(vpsde, VPSDE), "DDPM training only works for VPSDEs."
+
+  reduce_op = torch.mean if reduce_mean else lambda *args, **kwargs: 0.5 * torch.sum(*args, **kwargs)
+
+  def loss_fn(model, batch):
+    model_fn = mutils.get_model_fn(model, train=train)
+    labels = torch.randint(0, vpsde.N, (batch.shape[0],), device=batch.device)
+    sqrt_alphas_cumprod = vpsde.sqrt_alphas_cumprod.to(batch.device)
+    sqrt_1m_alphas_cumprod = vpsde.sqrt_1m_alphas_cumprod.to(batch.device)
+    noise = torch.randn_like(batch)
+    perturbed_data = sqrt_alphas_cumprod[labels, None, None, None] * batch + \
+                     sqrt_1m_alphas_cumprod[labels, None, None, None] * noise
+    score = model_fn(perturbed_data, labels)
+    losses = torch.square(score - noise)
+    losses = reduce_op(losses.reshape(losses.shape[0], -1), dim=-1)
+    loss = torch.mean(losses)
+    return loss
+
+  return loss_fn
+
+
+def get_step_fn(sde, train, optimize_fn=None, reduce_mean=False, continuous=True, likelihood_weighting=False, loss_type="original"):
   """Create a one-step training/evaluation function.
 
   Args:
     sde: An `sde_lib.SDE` object that represents the forward SDE.
-    model: A `flax.linen.Module` object that represents the architecture of the score-based model.
-    train: `True` for training and `False` for evaluation.
     optimize_fn: An optimization function.
     reduce_mean: If `True`, average the loss across data dimensions. Otherwise sum the loss across data dimensions.
     continuous: `True` indicates that the model is defined to take continuous time steps.
@@ -292,195 +239,48 @@ def get_step_fn(sde, model, train, optimize_fn=None, reduce_mean=False, continuo
     A one-step function for training or evaluation.
   """
   if continuous:
-    loss_fn = get_sde_loss_fn(sde, model, train, reduce_mean=reduce_mean,
-                              continuous=True, likelihood_weighting=likelihood_weighting,
-                              importance_weighting=importance_weighting,
-      eps=smallest_time,
-      score_matching_order=score_matching_order,
-    )
+    loss_fn = get_sde_loss_fn(sde, train, reduce_mean=reduce_mean,
+                              continuous=True, likelihood_weighting=likelihood_weighting, loss_type=loss_type)
   else:
-    raise ValueError(f"Discrete training for {sde.__class__.__name__} is not recommended.")
+    assert not likelihood_weighting, "Likelihood weighting is not supported for original SMLD/DDPM training."
+    if isinstance(sde, VESDE):
+      loss_fn = get_smld_loss_fn(sde, train, reduce_mean=reduce_mean)
+    elif isinstance(sde, VPSDE):
+      loss_fn = get_ddpm_loss_fn(sde, train, reduce_mean=reduce_mean)
+    else:
+      raise ValueError(f"Discrete training for {sde.__class__.__name__} is not recommended.")
 
-  def step_fn(carry_state, batch):
+  def step_fn(state, batch):
     """Running one step of training or evaluation.
 
     This function will undergo `jax.lax.scan` so that multiple steps can be pmapped and jit-compiled together
     for faster execution.
 
     Args:
-      carry_state: A tuple (JAX random state, `flax.struct.dataclass` containing the training state).
+      state: A dictionary of training information, containing the score model, optimizer,
+       EMA status, and number of optimization steps.
       batch: A mini-batch of training/evaluation data.
 
     Returns:
-      new_carry_state: The updated tuple of `carry_state`.
       loss: The average loss value of this state.
     """
-
-    (rng, state) = carry_state
-    rng, step_rng = jax.random.split(rng)
-    grad_fn = jax.value_and_grad(loss_fn, argnums=1, has_aux=True)
+    model = state['model']
     if train:
-      params = state.optimizer.target
-      states = state.model_state
-      (loss, (new_model_state, loss1, loss2, loss3)), grad = grad_fn(step_rng, params, states, batch)
-
-      grad = jax.lax.pmean(grad, axis_name='batch')
-      new_optimizer = optimize_fn(state, grad)
-      new_params_ema = jax.tree_multimap(
-        lambda p_ema, p: p_ema * state.ema_rate + p * (1. - state.ema_rate),
-        state.params_ema, new_optimizer.target
-      )
-      step = state.step + 1
-      new_state = state.replace(
-        step=step,
-        optimizer=new_optimizer,
-        model_state=new_model_state,
-        params_ema=new_params_ema
-      )
+      optimizer = state['optimizer']
+      optimizer.zero_grad()
+      loss = loss_fn(model, batch)
+      sum(loss).backward()
+      optimize_fn(optimizer, model.parameters(), step=state['step'])
+      state['step'] += 1
+      state['ema'].update(model.parameters())
     else:
-      loss, (_, loss1, loss2, loss3) = loss_fn(step_rng, state.params_ema, state.model_state, batch)
-      new_state = state
+      with torch.no_grad():
+        ema = state['ema']
+        ema.store(model.parameters())
+        ema.copy_to(model.parameters())
+        loss = loss_fn(model, batch)
+        ema.restore(model.parameters())
 
-    loss = jax.lax.pmean(loss, axis_name="batch")
-    loss1 = jax.lax.pmean(loss1, axis_name="batch")
-    loss2 = jax.lax.pmean(loss2, axis_name="batch")
-    loss3 = jax.lax.pmean(loss3, axis_name="batch")
-    new_carry_state = (rng, new_state)
-    return new_carry_state, (loss, loss1, loss2, loss3)
-
-  return step_fn
-
-
-def get_dequantization_loss_fn(sde, score_fn, deq_model, scaler, inverse_scaler,
-                               train=True, importance_weighting=True, eps=1e-5,
-                               eps_offset=True):
-  def div_drift_fn(x, t, eps):
-    div_fn = get_div_fn(lambda x, t: sde.sde(x, t)[0])
-    return div_fn(x, t, eps)
-
-  def loss_fn(rng, params, batch):
-    dequantizer = mutils.get_dequantizer(deq_model, params, train=train)
-
-    data = batch['image']
-    shape = data.shape
-    rng, step_rng = random.split(rng)
-    u = random.normal(step_rng, shape)
-    if train:
-      rng, step_rng = random.split(rng)
-      deq_noise, sldj = dequantizer(u, inverse_scaler(data), rng=step_rng)
-    else:
-      deq_noise, sldj = dequantizer(u, inverse_scaler(data))
-
-    data = scaler((inverse_scaler(data) * 255. + deq_noise) / 256.)
-
-    mean, std = sde.marginal_prob(data, jnp.ones((shape[0],)) * sde.T)
-    rng, step_rng = jax.random.split(rng)
-    z = jax.random.normal(step_rng, shape)
-    neg_prior_logp = -sde.prior_logp(mean + batch_mul(std, z))
-
-    rng, step_rng = random.split(rng)
-    if importance_weighting:
-      t = sde.sample_importance_weighted_time_for_likelihood(step_rng, (shape[0],), eps=eps)
-      Z = sde.likelihood_importance_cum_weight(sde.T, eps=eps)
-    else:
-      t = random.uniform(step_rng, (shape[0],), minval=eps, maxval=sde.T)
-
-    rng, step_rng = random.split(rng)
-    z = random.normal(step_rng, shape)
-    mean, std = sde.marginal_prob(data, t)
-    perturbed_data = mean + batch_mul(std, z)
-
-    score = score_fn(perturbed_data, t)
-    if importance_weighting:
-      losses = jnp.square(batch_mul(score, std) + z)
-      losses = jnp.sum(losses.reshape((losses.shape[0], -1)), axis=-1)
-      grad_norm = jnp.square(z).reshape((z.shape[0], -1)).sum(axis=-1)
-      losses = (losses - grad_norm) * Z
-    else:
-      g2 = sde.sde(jnp.zeros_like(data), t)[1] ** 2
-      losses = jnp.square(score + batch_mul(z, 1. / std))
-      losses = jnp.sum(losses.reshape((losses.shape[0], -1)), axis=-1) * g2
-      grad_norm = jnp.square(z).reshape((z.shape[0], -1)).sum(axis=-1)
-      grad_norm = grad_norm * g2 / (std ** 2)
-      losses = losses - grad_norm
-
-    rng, step_rng = random.split(rng)
-    z = random.normal(step_rng, shape)
-    rng, step_rng = random.split(rng)
-    t = random.uniform(step_rng, (shape[0],), minval=eps, maxval=sde.T)
-    mean, std = sde.marginal_prob(data, t)
-    noisy_data = mean + batch_mul(std, z)
-    rng, step_rng = random.split(rng)
-    epsilon = random.rademacher(step_rng, shape, dtype=jnp.float32)
-    drift_div = div_drift_fn(noisy_data, t, epsilon)
-
-    losses = neg_prior_logp + 0.5 * (losses - 2 * drift_div) - sldj
-    if eps_offset:
-      offset_fn = get_likelihood_offset_fn(sde, score_fn, eps)
-      rng, step_rng = random.split(rng)
-      losses = losses + offset_fn(step_rng, data)
-
-    dim = np.prod(shape[1:])
-    bpd = losses / np.log(2.)
-    bpd = bpd / dim
-    offset = jnp.log2(jax.grad(inverse_scaler)(0.)) + 8.
-    bpd += offset
-    bpd = bpd.mean()
-
-    loss = jnp.mean(losses)
-
-    return loss, bpd
-
-  return loss_fn
-
-
-def get_dequantizer_step_fn(sde, score_fn, deq_model, scaler, inverse_scaler,
-                            train, optimize_fn=None, importance_weighting=False, smallest_time=1e-5,
-                            eps_offset=True):
-  loss_fn = get_dequantization_loss_fn(sde, score_fn, deq_model, scaler, inverse_scaler, train,
-                                       importance_weighting=importance_weighting, eps=smallest_time,
-                                       eps_offset=eps_offset)
-
-  def step_fn(carry_state, batch):
-    """Running one step of training or evaluation.
-
-    This function will undergo `jax.lax.scan` so that multiple steps can be pmapped and jit-compiled together
-    for faster execution.
-
-    Args:
-      carry_state: A tuple (JAX random state, `flax.struct.dataclass` containing the training state).
-      batch: A mini-batch of training/evaluation data.
-
-    Returns:
-      new_carry_state: The updated tuple of `carry_state`.
-      loss: The average loss value of this state.
-    """
-
-    (rng, state) = carry_state
-    rng, step_rng = jax.random.split(rng)
-    grad_fn = jax.value_and_grad(loss_fn, argnums=1, has_aux=True)
-    if train:
-      params = state.optimizer.target
-      (loss, bpd), grad = grad_fn(step_rng, params, batch)
-
-      grad = jax.lax.pmean(grad, axis_name='batch')
-      new_optimizer = optimize_fn(state, grad)
-      new_params_ema = jax.tree_multimap(
-        lambda p_ema, p: p_ema * state.ema_rate + p * (1. - state.ema_rate),
-        state.params_ema, new_optimizer.target
-      )
-      step = state.step + 1
-      new_state = state.replace(
-        step=step,
-        optimizer=new_optimizer,
-        params_ema=new_params_ema
-      )
-    else:
-      loss, bpd = loss_fn(step_rng, state.params_ema, batch)
-      new_state = state
-
-    loss = jax.lax.pmean(loss, axis_name='batch')
-    new_carry_state = (rng, new_state)
-    return new_carry_state, (loss, bpd)
+    return loss
 
   return step_fn

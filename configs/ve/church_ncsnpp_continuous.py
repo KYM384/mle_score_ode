@@ -25,17 +25,12 @@ def get_config():
   training = config.training
   training.sde = 'vesde'
   training.continuous = True
-  # training.reduce_mean = False
-  training.reduce_mean = True
-  training.likelihood_weighting = False
-  training.importance_weighting = False
 
   # sampling
   sampling = config.sampling
   sampling.method = 'pc'
   sampling.predictor = 'reverse_diffusion'
   sampling.corrector = 'langevin'
-  sampling.smallest_time = 1e-5
 
   # data
   data = config.data
