@@ -1,0 +1,36 @@
+# Source is bind-mounted at run time, so the build context only needs the
+# Dockerfile itself. Keep the context tiny and never ship large/secret artifacts.
+
+# VCS / tooling
+.git
+.gitignore
+.github
+
+# Python caches
+__pycache__
+**/__pycache__
+*.py[cod]
+*.egg-info
+.ipynb_checkpoints
+
+# Built images / archives (never bake a .sif or docker tar into the context)
+.docker
+*.sif
+*.tar
+
+# Experiment outputs, checkpoints, logs (huge; produced at run time)
+experiments
+runs
+wandb
+*.log
+
+# Large data / FID assets — provided via bind-mount / assets/stats at run time
+assets/stats/*.npz
+data
+*.npz
+*.tfrecord
+
+# Editor / OS cruft
+.vscode
+.idea
+.DS_Store

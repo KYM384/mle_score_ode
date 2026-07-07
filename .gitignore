@@ -21,3 +21,13 @@ dist/
 *.DS_Store
 
 experiments
+
+# Container build artifacts (Singularity image + spython-generated def; can be GBs)
+.docker/
+*.sif
+*.def
+*.tar
+.venv/
+
+# Weights & Biases local run logs
+wandb/

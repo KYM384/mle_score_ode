@@ -32,7 +32,7 @@ import tensorflow_gan as tfgan
 import logging
 import functools
 from flax.metrics import tensorboard
-# import wandb
+import wandb
 from flax.training import checkpoints
 # Keep the import below for registering all model definitions
 from models import ncsnpp
@@ -68,8 +68,12 @@ def train(config, workdir):
   tf.io.gfile.makedirs(tb_dir)
   if jax.host_id() == 0:
     writer = tensorboard.SummaryWriter(tb_dir)
-    # wandb.init(project='score_sde', name=os.path.basename(os.path.normpath(workdir)),
-    #          config=config.to_dict(), resume=True)
+    # Log to Weights & Biases. Fixed id (= workdir name) + resume="allow" lets a
+    # preempted / resubmitted job continue the SAME run instead of forking a new one.
+    # Auth once with `wandb login` (writes ~/.netrc, visible in the container via $HOME).
+    run_name = os.path.basename(os.path.normpath(workdir))
+    wandb.init(project='score_sde', name=run_name, id=run_name,
+               config=config.to_dict(), resume="allow")
 
   # Setup SDEs
   if config.training.sde.lower() == 'vpsde':
@@ -183,7 +187,10 @@ def train(config, workdir):
       logging.info(
         "step: %d, training_loss: %.5e, training_loss1: %.5e, training_loss2: %.5e, training_loss3: %.5e" % (step, loss.mean(), loss1.mean(), loss2.mean(), loss3.mean())
       )
-      # wandb.log({'training_loss': float(loss.mean())}, step=step)
+      wandb.log({'training_loss': float(loss.mean()),
+                 'training_loss1': float(loss1.mean()),
+                 'training_loss2': float(loss2.mean()),
+                 'training_loss3': float(loss3.mean())}, step=step)
       writer.scalar("training_loss", loss.mean(), step=step)
       writer.scalar("training_loss1", loss1.mean(), step=step)
       writer.scalar("training_loss2", loss2.mean(), step=step)
@@ -212,7 +219,10 @@ def train(config, workdir):
         logging.info(
           "step: %d, eval_loss: %.5e, eval_loss1: %.5e, eval_loss2: %.5e, eval_loss3: %.5e" % (step, eval_loss.mean(), eval_loss1.mean(), eval_loss2.mean(), eval_loss3.mean())
         )
-        # wandb.log({'eval_loss': float(eval_loss.mean())}, step=step)
+        wandb.log({'eval_loss': float(eval_loss.mean()),
+                   'eval_loss1': float(eval_loss1.mean()),
+                   'eval_loss2': float(eval_loss2.mean()),
+                   'eval_loss3': float(eval_loss3.mean())}, step=step)
         writer.scalar("eval_loss", eval_loss.mean(), step=step)
         writer.scalar("eval_loss1", eval_loss1.mean(), step=step)
         writer.scalar("eval_loss2", eval_loss2.mean(), step=step)
