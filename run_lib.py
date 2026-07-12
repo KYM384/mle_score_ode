@@ -28,7 +28,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tensorflow as tf
-import tensorflow_gan as tfgan
 import logging
 import functools
 from flax.metrics import tensorboard
@@ -41,7 +40,6 @@ import sampling
 import utils
 from models import utils as mutils
 import datasets
-import evaluation
 import likelihood
 import bound_likelihood
 import sde_lib
@@ -432,9 +430,15 @@ def evaluate(config,
 
   rng = eval_meta.rng
 
-  # Use inceptionV3 for images with resolution higher than 256.
-  inceptionv3 = config.data.image_size >= 256
-  inception_model = evaluation.get_inception_model(inceptionv3=inceptionv3)
+  if config.eval.enable_sampling:
+    # tensorflow_gan requires tf.estimator (removed in TF>=2.16); only import
+    # it when FID/IS evaluation actually needs it so NLL-only eval runs on
+    # newer TF installs.
+    import tensorflow_gan as tfgan
+    import evaluation
+    # Use inceptionV3 for images with resolution higher than 256.
+    inceptionv3 = config.data.image_size >= 256
+    inception_model = evaluation.get_inception_model(inceptionv3=inceptionv3)
 
   logging.info("begin checkpoint: %d" % (begin_ckpt,))
   for ckpt in range(begin_ckpt, config.eval.end_ckpt + 1):
